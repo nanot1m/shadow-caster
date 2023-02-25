@@ -86,6 +86,7 @@ button:focus-visible {
 canvas {
     border: 1px solid #1a1a1a;
     background-color: #343a40;
+    cursor: none;
 }
 
 @media (prefers-color-scheme: light) {

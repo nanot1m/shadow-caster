@@ -52,12 +52,40 @@ const EAST = 1
 const SOUTH = 2
 const WEST = 3
 
+const transactionable = (fn: () => void) => {
+    let isTransaction = false
+    let wasCalled = false
+    const mixins = {
+        lock() {
+            isTransaction = true
+        },
+        unlock() {
+            isTransaction = false
+            if (wasCalled) {
+                fn()
+            }
+            wasCalled = false
+        },
+        isTransaction() {
+            return isTransaction
+        },
+    }
+    return Object.assign(() => {
+        if (isTransaction) {
+            wasCalled = true
+        } else {
+            fn()
+        }
+    }, mixins)
+}
+
 export function setupCanvas(canvas: HTMLCanvasElement) {
     scaleCanvasByDevicePixelRatio(
         canvas,
         TILE_SIZE * TILE_X_COUNT,
         TILE_SIZE * TILE_Y_COUNT,
     )
+    const ctx = canvas.getContext("2d")!
 
     let isCreating = false
     let isRemoving = false
@@ -69,13 +97,29 @@ export function setupCanvas(canvas: HTMLCanvasElement) {
     let renderTime = 0
     let fps = 0
 
-    const ctx = canvas.getContext("2d")!
+    const tComputeEdges = transactionable(computeEdges)
 
-    const { hasCell, getCell, setCell, getAllCells } = createCells()
+    const { hasCell, getCell, setCell, getAllCells } = new Proxy(
+        createCells(),
+        {
+            get(
+                target: ReturnType<typeof createCells>,
+                prop: keyof typeof target,
+            ) {
+                if (prop === "setCell") {
+                    return (x: number, y: number, value: boolean) => {
+                        target.setCell(x, y, value)
+                        tComputeEdges()
+                    }
+                }
+                return target[prop]
+            },
+        },
+    )
     const { getEdge, addEdge, getAllEdges, clearEdges } = createEdges()
     const rays: Ray[] = []
 
-    // fill cells around the edges
+    tComputeEdges.lock()
     for (let x = 0; x < TILE_X_COUNT; x++) {
         setCell(x, 0, true)
         setCell(x, TILE_Y_COUNT - 1, true)
@@ -84,7 +128,7 @@ export function setupCanvas(canvas: HTMLCanvasElement) {
         setCell(0, y, true)
         setCell(TILE_X_COUNT - 1, y, true)
     }
-    computeEdges()
+    tComputeEdges.unlock()
 
     loop(performance.now())
 
@@ -267,20 +311,18 @@ export function setupCanvas(canvas: HTMLCanvasElement) {
 
     canvas.addEventListener("mousemove", (e) => {
         const { offsetX: x, offsetY: y } = e
-        lightSource = [x, y]
 
         const tileX = Math.floor(x / TILE_SIZE)
         const tileY = Math.floor(y / TILE_SIZE)
 
         if (isCreating) {
             setCell(tileX, tileY, true)
-            computeEdges()
         }
         if (isRemoving) {
             setCell(tileX, tileY, false)
-            computeEdges()
         }
 
+        lightSource = [x, y]
         hovered = [tileX, tileY]
         getRaysToEdges()
     })
@@ -301,7 +343,6 @@ export function setupCanvas(canvas: HTMLCanvasElement) {
         isRemoving = isOnCell
         isCreating = !isOnCell
         setCell(tileX, tileY, !hasCell(tileX, tileY))
-        computeEdges()
     })
     window.addEventListener("mouseup", () => {
         isRemoving = false
@@ -320,24 +361,37 @@ export function setupCanvas(canvas: HTMLCanvasElement) {
         ctx.clearRect(0, 0, canvas.width, canvas.height)
         // drawGrid()
         drawCells()
-        drawEdges()
-        // drawHovered()
+        // drawEdges()
         // drawRays()
-        drawPolygons()
+        drawLight()
         drawLightSource()
+        // drawHovered()
         drawDebug()
     }
 
-    function drawDebug() {
-        ctx.fillStyle = "white"
+    function drawLightSource() {
+        if (!lightSource) return
+        // draw sun emoji
+        ctx.save()
+        ctx.fillStyle = "yellow"
         ctx.globalAlpha = 1
+        ctx.font = TILE_SIZE + "px sans-serif"
+        ctx.textAlign = "center"
+        ctx.textBaseline = "middle"
+        ctx.fillText("🌞", lightSource[0], lightSource[1])
+        ctx.restore()
+    }
+
+    function drawDebug() {
+        ctx.globalAlpha = 1
+        ctx.font = "10px sans-serif"
+        ctx.fillStyle = "white"
         ctx.fillText(
             `RT: ${renderTime.toFixed(2)}ms; RC: ${
                 rays.length
             }; FPS: ${fps.toFixed(0)}`,
             10,
             10,
-            200,
         )
     }
 
@@ -391,16 +445,6 @@ export function setupCanvas(canvas: HTMLCanvasElement) {
         }
     }
 
-    function drawLightSource() {
-        if (!lightSource) return
-        const [x, y] = lightSource
-        ctx.fillStyle = "white"
-        ctx.globalAlpha = 1
-        ctx.beginPath()
-        ctx.arc(x, y, TILE_SIZE / 4, 0, Math.PI * 2)
-        ctx.fill()
-    }
-
     function drawRays() {
         if (!lightSource) return
 
@@ -416,17 +460,31 @@ export function setupCanvas(canvas: HTMLCanvasElement) {
         }
     }
 
-    function drawPolygons() {
+    function drawLight() {
         if (rays.length < 1) return
-        ctx.fillStyle = "white"
-        ctx.globalAlpha = 1
-        ctx.beginPath()
-        ctx.moveTo(rays[0].ex, rays[0].ey)
+
+        const region = new Path2D()
+        region.moveTo(rays[0].ex, rays[0].ey)
         for (let i = 1; i < rays.length; i++) {
-            ctx.lineTo(rays[i].ex, rays[i].ey)
+            region.lineTo(rays[i].ex, rays[i].ey)
         }
-        ctx.closePath()
+        region.closePath()
+
+        ctx.save()
+        ctx.clip(region, "nonzero")
+
+        const [x, y] = lightSource ?? [0, 0]
+        const gradient = ctx.createRadialGradient(x, y, 0, x, y, 100)
+        gradient.addColorStop(0, "rgba(255, 255, 255, 1)")
+        gradient.addColorStop(1, "rgba(255, 255, 255, 0)")
+        ctx.fillStyle = gradient
+        ctx.globalAlpha = 0.8
+
+        ctx.beginPath()
+        ctx.arc(x, y, 100, 0, Math.PI * 2)
         ctx.fill()
+
+        ctx.restore()
     }
 }
 
